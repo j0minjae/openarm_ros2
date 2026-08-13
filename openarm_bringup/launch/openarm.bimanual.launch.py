@@ -287,7 +287,7 @@ def generate_launch_description():
     return LaunchDescription(
         declared_arguments + [
             robot_nodes_spawner_func,
-            rviz_node,
+            # rviz_node,
             TimerAction(period=LAUNCH_DELAY_SECONDS, actions=[
                         joint_state_broadcaster_spawner]),
             TimerAction(period=LAUNCH_DELAY_SECONDS,
