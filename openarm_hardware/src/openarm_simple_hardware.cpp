@@ -20,13 +20,39 @@
 #include <thread>
 #include <vector>
 
+#include <cmath>
+
+#include <pinocchio/algorithm/joint-configuration.hpp>
+#include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/multibody/data.hpp>
+#include <pinocchio/multibody/model.hpp>
+#include <pinocchio/parsers/urdf.hpp>
+
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 namespace openarm_hardware {
 
+// Holds the pinocchio model/data for in-hardware gravity computation. Defined here
+// (not in the header) so pinocchio's heavy templates stay out of the public header.
+struct GravityModel {
+  pinocchio::Model model;
+  pinocchio::Data data;
+  std::vector<int> iq;   // config index of each arm joint in q
+  std::vector<int> iv;   // velocity/gravity index of each arm joint
+  Eigen::VectorXd q;     // working configuration (non-arm joints stay neutral)
+  explicit GravityModel(pinocchio::Model m)
+      : model(std::move(m)), data(model) {}
+};
+
+static std::string to_lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+  return s;
+}
+
 OpenArmHW::OpenArmHW() = default;
+OpenArmHW::~OpenArmHW() = default;
 
 bool OpenArmHW::parse_config(const hardware_interface::HardwareInfo& info) {
   // Parse CAN interface (default: can0)
@@ -120,6 +146,69 @@ void OpenArmHW::generate_joint_names() {
               joint_names_.size(), arm_prefix_.c_str());
 }
 
+void OpenArmHW::build_gravity_model() {
+  gravity_ff_.assign(ARM_DOF, 0.0);
+  grav_enabled_ = false;
+  grav_.reset();
+
+  auto it = info_.hardware_parameters.find("gravity_compensation");
+  bool want_grav = (it == info_.hardware_parameters.end())
+                       ? true
+                       : (to_lower(it->second) == "true");
+  if (!want_grav) {
+    RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
+                "Gravity compensation disabled by parameter");
+    return;
+  }
+
+  const std::string& xml = info_.original_xml;
+  if (xml.empty()) {
+    RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
+                "No URDF (original_xml) available -> gravity compensation OFF");
+    return;
+  }
+
+  try {
+    pinocchio::Model model;
+    pinocchio::urdf::buildModelFromXML(xml, model);
+    auto gm = std::make_unique<GravityModel>(std::move(model));
+    gm->q = pinocchio::neutral(gm->model);
+    gm->iq.resize(ARM_DOF);
+    gm->iv.resize(ARM_DOF);
+    for (size_t i = 0; i < ARM_DOF; ++i) {
+      const std::string& jn = joint_names_[i];
+      if (!gm->model.existJointName(jn)) {
+        RCLCPP_WARN(rclcpp::get_logger("OpenArmHW"),
+                    "Joint '%s' not in URDF model -> gravity compensation OFF",
+                    jn.c_str());
+        return;
+      }
+      auto jid = gm->model.getJointId(jn);
+      gm->iq[i] = static_cast<int>(gm->model.joints[jid].idx_q());
+      gm->iv[i] = static_cast<int>(gm->model.joints[jid].idx_v());
+    }
+    grav_ = std::move(gm);
+    grav_enabled_ = true;
+
+    it = info_.hardware_parameters.find("friction_compensation");
+    friction_enabled_ = (it == info_.hardware_parameters.end())
+                            ? true
+                            : (to_lower(it->second) == "true");
+
+    RCLCPP_INFO(
+        rclcpp::get_logger("OpenArmHW"),
+        "Gravity compensation ON (model nq=%d, arm_prefix='%s', friction=%s)",
+        static_cast<int>(grav_->model.nq), arm_prefix_.c_str(),
+        friction_enabled_ ? "on" : "off");
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                 "Gravity model build failed (%s) -> gravity compensation OFF",
+                 e.what());
+    grav_.reset();
+    grav_enabled_ = false;
+  }
+}
+
 hardware_interface::CallbackReturn OpenArmHW::on_init(
     const hardware_interface::HardwareInfo& info) {
   if (hardware_interface::SystemInterface::on_init(info) !=
@@ -184,6 +273,9 @@ hardware_interface::CallbackReturn OpenArmHW::on_configure(
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
 
+  // Build the pinocchio gravity model from the full URDF (fails safe to OFF).
+  build_gravity_model();
+
   return CallbackReturn::SUCCESS;
 }
 
@@ -227,6 +319,9 @@ hardware_interface::CallbackReturn OpenArmHW::on_activate(
   openarm_->enable_all();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
+
+  // Ramp gravity FF in from zero over the first ~second after activation.
+  grav_ramp_ = 0.0;
 
   // Return to zero position
   return_to_zero();
@@ -284,11 +379,32 @@ hardware_interface::return_type OpenArmHW::read(
 
 hardware_interface::return_type OpenArmHW::write(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+  // Gravity (+ optional friction) feedforward: computed from the current measured
+  // pose and summed into the MIT torque below. tau = kp*(p*-p)+kd*(v*-v)+tau_ff.
+  if (grav_enabled_ && grav_) {
+    grav_ramp_ = std::min(1.0, grav_ramp_ + 1.0 / 750.0);  // ~1 s ramp-in
+    for (size_t i = 0; i < ARM_DOF; ++i) grav_->q[grav_->iq[i]] = pos_states_[i];
+    const Eigen::VectorXd& g =
+        pinocchio::computeGeneralizedGravity(grav_->model, grav_->data, grav_->q);
+    for (size_t i = 0; i < ARM_DOF; ++i) {
+      double tau_ff = g[grav_->iv[i]];
+      if (friction_enabled_) {
+        double v = vel_states_[i];
+        double ss = std::max(-1.0, std::min(1.0, v / fric_veps_));  // smooth sign
+        tau_ff += fric_scale_ * fric_c_[i] * ss + fric_b_[i] * v;
+      }
+      tau_ff *= grav_ramp_;
+      gravity_ff_[i] =
+          std::max(-grav_clamp_[i], std::min(grav_clamp_[i], tau_ff));
+    }
+  }
+
   // Control arm motors with MIT control
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
+    double tau = tau_commands_[i] + (grav_enabled_ ? gravity_ff_[i] : 0.0);
     arm_params.push_back(
-        {kp_[i], kd_[i], pos_commands_[i], vel_commands_[i], tau_commands_[i]});
+        {kp_[i], kd_[i], pos_commands_[i], vel_commands_[i], tau});
   }
   openarm_->get_arm().mit_control_all(arm_params);
   // Control gripper if enabled

@@ -31,6 +31,10 @@
 
 namespace openarm_hardware {
 
+// Defined in the .cpp; holds the pinocchio model/data so pinocchio headers stay
+// out of this public header.
+struct GravityModel;
+
 /**
  * @brief Simplified OpenArm V10 Hardware Interface
  *
@@ -41,6 +45,7 @@ namespace openarm_hardware {
 class OpenArmHW : public hardware_interface::SystemInterface {
  public:
   OpenArmHW();
+  ~OpenArmHW();
 
   TEMPLATES__ROS2_CONTROL__VISIBILITY_PUBLIC
   hardware_interface::CallbackReturn on_init(
@@ -135,6 +140,23 @@ class OpenArmHW : public hardware_interface::SystemInterface {
   std::vector<double> vel_states_;
   std::vector<double> tau_states_;
 
+  // --- Gravity (+ friction) feedforward: approach 1, in-hardware, synchronous ---
+  // Each write() computes tau_ff = g(q) [+ Coulomb/viscous] and sums it into the
+  // MIT torque, so the DM PD loop no longer needs a steady-state error to hold
+  // against gravity. Fails safe to OFF (tau_ff=0) if the model can't be built.
+  std::unique_ptr<GravityModel> grav_;
+  bool grav_enabled_ = false;      // model built AND gravity_compensation param on
+  bool friction_enabled_ = false;  // add Coulomb+viscous friction FF
+  std::vector<double> gravity_ff_;  // computed tau_ff per arm joint [Nm]
+  double grav_ramp_ = 0.0;          // 0..1 safety ramp, reset on each activation
+  // Measured joint2 friction (2026-08-14 sweep); others 0 until identified.
+  std::vector<double> fric_c_ = {0.0, 0.60, 0.0, 0.0, 0.0, 0.0, 0.0};  // Coulomb [Nm]
+  std::vector<double> fric_b_ = {0.0, 0.00, 0.0, 0.0, 0.0, 0.0, 0.0};  // viscous [Nm*s]
+  double fric_veps_ = 0.08;   // smooth-sign band [rad/s]
+  double fric_scale_ = 0.8;   // Coulomb under-scale
+  // Per-joint |tau_ff| ceiling [Nm]: gravity peak + friction + margin.
+  std::vector<double> grav_clamp_ = {15.0, 15.0, 4.0, 7.0, 3.0, 2.0, 2.0};
+
   static constexpr std::array<double, ARM_DOF> ZERO_POSITION = {
       0.0,  // joint1
       0.0,  // joint2
@@ -149,6 +171,7 @@ class OpenArmHW : public hardware_interface::SystemInterface {
   void return_to_zero();
   bool parse_config(const hardware_interface::HardwareInfo& info);
   void generate_joint_names();
+  void build_gravity_model();  // build pinocchio model from info_.original_xml
 
   // Gripper mapping functions
   double joint_to_motor_radians(double joint_value);

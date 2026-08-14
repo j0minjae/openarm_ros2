@@ -29,6 +29,10 @@ find_package(rclcpp_lifecycle REQUIRED)
 # Find openarm_can library
 find_package(OpenArmCAN REQUIRED)
 
+# pinocchio for in-hardware gravity (+friction) feedforward
+find_package(pinocchio REQUIRED)
+find_package(Eigen3 REQUIRED)
+
 add_library(${PROJECT_NAME} SHARED
   src/openarm_simple_hardware.cpp
 )
@@ -41,6 +45,8 @@ target_include_directories(
 
 target_link_libraries(${PROJECT_NAME}
   OpenArmCAN::openarm_can
+  pinocchio::pinocchio
+  Eigen3::Eigen
 )
 
 ament_target_dependencies(${PROJECT_NAME}
@@ -73,6 +79,7 @@ ament_export_dependencies(
   openarm_can
   pluginlib
   rclcpp
+  pinocchio
 )
 
 ament_package()
