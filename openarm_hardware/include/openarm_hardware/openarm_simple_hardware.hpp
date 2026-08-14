@@ -149,9 +149,11 @@ class OpenArmHW : public hardware_interface::SystemInterface {
   bool friction_enabled_ = false;  // add Coulomb+viscous friction FF
   std::vector<double> gravity_ff_;  // computed tau_ff per arm joint [Nm]
   double grav_ramp_ = 0.0;          // 0..1 safety ramp, reset on each activation
-  // Measured joint2 friction (2026-08-14 sweep); others 0 until identified.
-  std::vector<double> fric_c_ = {0.0, 0.60, 0.0, 0.0, 0.0, 0.0, 0.0};  // Coulomb [Nm]
-  std::vector<double> fric_b_ = {0.0, 0.00, 0.0, 0.0, 0.0, 0.0, 0.0};  // viscous [Nm*s]
+  // Measured Coulomb friction per joint (2026-08-14 up/down sweep, left arm;
+  // applied to both arms as an approximation). Viscous not yet identified.
+  std::vector<double> fric_c_ = {0.545, 0.60, 0.457, 0.787,
+                                 0.190, 0.165, 0.110};  // Coulomb [Nm]
+  std::vector<double> fric_b_ = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // viscous [Nm*s]
   double fric_veps_ = 0.08;   // smooth-sign band [rad/s]
   double fric_scale_ = 0.8;   // Coulomb under-scale
   // Per-joint |tau_ff| ceiling [Nm]: gravity peak + friction + margin.
